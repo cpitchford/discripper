@@ -1,0 +1,653 @@
+#!/bin/bash
+
+SUBTITLES=( --native-language eng )
+HANDBRAKE_ARGS_DVD=( "${SUBTITLES[@]}" -O --main-feature --preset="Universal" -b 1300 )
+HANDBRAKE_ARGS_BLURAY=( --subtitle-burn 1  "${SUBTITLES[@]}" -O --preset="Android Tablet" )
+DEVICE=/dev/sr0
+UPLOAD=user@sftpserver:/path/to/media/
+UPLOADMIN=100000000
+
+
+
+readonly TMP=/tmp/rip.sh.$$
+
+declare -A LOCKS=( )
+LOCKS[drive]=/var/run/rip.sh.lock.drive
+LOCKS[encode]=/var/run/rip.sh.lock.encode
+
+
+exec 3>"${LOCKS[drive]}"
+exec 4>"${LOCKS[encode]}"
+
+PREFIX=/opt/bluray
+
+
+
+
+
+PipeStatus() {
+  local i=( "${PIPESTATUS[@]}" )
+  local j
+  for j in "${i[@]}" ; do
+    if [[ $j -ne 0 ]] ; then
+      return $j
+    fi
+  done
+  return 0
+}
+
+Bomb() {
+  printf "FATAL: %s\n" "$*"
+
+  local i
+  let i=-1;
+  while PipeStatus ; do
+    let ++i
+   caller $i | {
+    read lineno functionname file
+    [[ -n "$functionname" ]] && printf "%-$(( (i+1) * 3))s\`->%s:%d\n" "" "$functionname" "$lineno"
+    }
+   done
+   exit 127
+}
+
+
+
+
+
+
+LockEncode() {
+  if [[ -f "$TMP/lock.encode" ]] ; then
+    return 0
+  fi
+  
+  if [[ -f "$TMP/lock.drive" ]] ;then
+    flock -u 3 || Bomb "Cannot lock drive"
+    rm "$TMP/lock.drive"  
+  fi
+  if ! flock -nx 4 ; then
+    echo "Waiting to take encode lock"
+    flock -x 4 || Bomb "Cannot lock encoder"
+  fi
+  touch "$TMP/lock.encode" || Bomb "Cannot set encoder lock"
+}
+
+LockDrive() {
+  local -A disc=( )
+  if [[ -f "$TMP/lock.drive" ]] ; then
+    return 0
+  fi
+  
+  if [[ -f "$TMP/lock.encode" ]] ;then
+    flock -u 4 || Bomb "Cannot lock encoder"
+    rm "$TMP/lock.drive"  
+  fi
+
+  if ! flock -nx 3 ; then
+    echo "Waiting to take drive lock"
+    flock -x 3|| Bomb "Cannot lock drive"
+    touch "$TMP/lock.drive" || Bomb "Cannot set drive lock"
+    
+    echo "Ejecting.."
+    eject "$DEVICE"
+    while true ; do
+      get_disc_info disc
+      if [[ -n "${disc[type]}" ]] ; then
+        break
+      fi
+      sleep 3
+    done
+  fi
+}
+
+Unlock() {
+  if [[ -f "$TMP/lock.encode" ]] ; then
+    flock -u 4
+    rm "$TMP/lock.encode"
+  fi
+  if [[ -f "$TMP/lock.drive" ]] ; then
+    flock -u 3
+    rm "$TMP/lock.drive"
+  fi
+}
+
+  
+
+
+
+CleanUp() {
+  rm -r "$TMP"
+}
+
+mkdir "$TMP" || Bomb "Cannot create temp folder: $TMP"
+trap CleanUp EXIT
+
+
+
+er() {
+  printf "%s\n" "$*"  1>&2
+}
+
+upload() {
+  local size
+  local f="$1"
+  if [[ $f != /* ]] ; then
+    f="./$f"
+  fi
+  
+  if [[ ! -f "$f" ]] ; then
+    return 1
+  fi
+  if [[ ! -r "$f" ]] ; then
+    return 1
+  fi
+  size="`stat --format "%s" -- "$f"`" || return 1
+  
+  if [[ $size -lt "$UPLOAD_MIN" ]] ; then
+    return 1
+  fi
+  
+  scp "$f" "$UPLOAD"
+  return $?
+}
+
+_get_subtitles() {
+  HandBrakeCLI --scan "$@" 2>&1 | awk '{
+  if ($0 ~ /+ subtitle tracks:/) {
+    st=1
+    next
+  }
+  if (st!=1) {
+    next
+  }
+
+  if ($0 !~ /^ *\+ [0-9]+, /){
+    st=0
+  }
+  if ($0 ~ /[Ee]nglish/) {
+    num=$2
+    sub(/[^0-9]/,"",num)
+    titles[num]=1
+  }
+}
+END{
+  l=""
+  for(i in titles) {
+    if (i ~ /^[1-9][0-9]*$/) {
+      l=l first i
+      first=","
+    }
+  }
+  if (l!="") 
+  printf l
+}'
+}
+
+get_subtitles() {
+  local gs_out=( )
+  local gs_var="$1"
+  local gs_i=
+  shift
+  if gs_i="`_get_subtitles "$@"`" && [[ -n $gs_i ]] ; then
+    gs_out=( -s scan,"$gs_i" -F 1 --subtitle-default 1 )
+  else
+    gs_out=( -s scan -F 1 --subtitle-default 1 )
+  fi
+  eval "$gs_var"'=( "${gs_out[@]}" )'
+  return $?
+}
+
+    
+
+  
+
+_get_disc_info() {
+  echo "$1=( )"
+  local key value
+  udevadm info -n sr0 -q property | while IFS== read -r key value ; do
+    case "$key" in
+      ID_CDROM_MEDIA_DVD)
+        if [[ $value = "1" ]] ; then
+          echo "$1[type]=dvd"
+          continue
+        fi
+      ;;
+      ID_CDROM_MEDIA_BD)
+        if [[ $value = "1" ]] ; then
+          echo "$1[type]=bluray"
+          continue
+        fi
+      ;;
+      ID_FS_LABEL)
+        printf "%s[label]=%q\n" "$1" "$value"
+        printf "%s[title]=%q\n" "$1" "$(get_title "$value")"
+      ;;
+    esac
+  done
+}
+
+get_disc_info() {
+  eval "`_get_disc_info "$1"`"
+}
+
+get_title() {
+  local t="$1" o=
+  t="${t//[*:\\\/]/_}"
+  while [[ $o != "$t" ]] ; do
+    o="$t"
+    t="${t#[.*:\\]}"
+    t="${t//__/_}"
+  done
+  printf "%s\n" "$t"
+}
+
+
+
+defaultfs=""
+
+progress() {
+
+  awk -v WIDTH="$width" -F"$defaultfs" '
+function console() {
+  WIDTH=WIDTH-2
+  if (WIDTH<30) {
+    BARWIDTH=10
+    TEXTWIDTH=WIDTH-10
+  } else {
+    BARWIDTH=int(WIDTH/2)
+    if (BARWIDTH>50) BARWIDTH=50
+    TEXTWIDTH=WIDTH-BARWIDTH
+  }
+}
+
+function clearline() {
+  printf "\r\033[2K"
+}
+
+function tstring(timeleft,x) {
+  timeleft=int(timeleft)
+  if (timeleft <= 0)
+    return "?"
+  else if (timeleft<60)
+    return sprintf("%ds",timeleft)
+  else if (timeleft<3600)
+    return sprintf("%dm%02ds",int(timeleft/60),timeleft%60)
+  else
+    return sprintf("%dh%02dm",int(timeleft/3600),int(timeleft/60)%60)
+}
+function completed(x) {
+  dur=systime()-start
+  clearline()
+  printf "%s: %s\n",tstring(systime()-start),message
+}
+function startline(m) {
+  if (message!="") completed()
+  else clearline()
+  start=systime()
+  printf "%"BARWIDTH"s %."TEXTWIDTH"s"," ",m
+  message=m
+}
+
+function progress(current,max,a,b,c,d) {
+  duration=systime() - start
+  if (duration == lastduration) return
+  lastduration = duration
+  remainder=max-current
+  percentage=(current*1.0)/max
+  if (duration > 0 && percentage > 0.0) {
+    totaltime=duration/percentage  
+    timeleft=totaltime-duration
+    timestr=tstring(timeleft)
+  }
+  else {
+    totaltime=0
+    timeleft=0
+    timestr="0"
+  }
+  
+  bar=sprintf("%"int((BARWIDTH-20)*percentage)+1"s",">")
+  gsub(/ /,"=",bar)
+  clearline()
+  printf "%5.1f%% [%6s] [%-"BARWIDTH-20"."BARWIDTH-20"s] %."TEXTWIDTH"s\r",percentage*100,timestr,bar,message
+}
+'"$1"
+}
+read col width <<<"`stty size`"
+
+
+makemkvcon() {
+  LD_LIBRARY_PATH="$PREFIX/lib" "$PREFIX/bin/makemkvcon" "$@"
+  return $?
+}
+
+
+
+progress_makemkv() {
+  makemkvcon "$@" | progress '
+  BEGIN{
+    console()
+  }
+($0 ~ /^MSG:/) {
+    sub(/^MSG:[0-9]*,[0-9]*,[0-9]*,"/,"",$0)
+    sub(/",".*$/,"",$0)
+  startline($0)
+}
+($0 ~ /^PRGV:/) {
+    sub(/^PRGV:/,"",$0)
+  a=$0
+  b=$0
+  sub(/,.*$/,"",a)
+  sub(/^.*,/,"",b)
+  progress(a,b)
+}
+END{
+if (message!="") completed()
+}'
+PipeStatus
+return $?
+}
+
+
+handbrake_progress() {
+  local ret i
+#  echo "Starting handbrake:"
+#  printf "HandBrakeCLI "
+#  for i in "$@" ; do printf " %q" "$i" ;done
+#  printf "\n"
+  
+  HandBrakeCLI "$@" 2> "$TMP/handbrake.log" | progress '
+  BEGIN {
+    console()
+    RS="\r"
+  }
+  {
+    newmessage=$0
+    sub(/ [0-9.]* %.*$/,"",newmessage)
+    percent=$0
+    sub(/ %.*$/,"",percent)
+    sub(/^.* /,"",percent)
+    if (newmessage!=message) 
+      startline(newmessage)
+    progress(percent,100.0)
+  }
+END{
+if (message!="") completed()
+}'
+  ret=$?
+  if [[ $ret -eq 0 ]] ; then 
+    return 0
+  fi
+  cat "$TMP/handbrake.log" 1>&2
+  return $ret
+}
+
+rip_disc() {
+  local -A disc
+  get_disc_info disc
+  case "${disc[type]}" in
+    bluray) rip_bluray "$@" ;;
+    dvd) rip_dvd "$@" ;;
+    ""|*) er "Unknown disc type: ${disc[type]}"; return 1
+  esac
+}
+
+
+
+rip_dir() {
+  local -A disc
+  local source="$1"
+  local output="${2:-$1.mkv}"
+  
+  if [[ $output = "auto" || -z $output ]] ; then
+    output="$1.mkv"
+  fi
+  
+  if [[ ! -d $source ]] ; then
+    er "Cannot find disc backup: $1"
+    return 1
+  fi
+  echo "Ripping $source to $output"
+  mkdir "$TMP/convert"
+
+  local titletrack="$3"
+  local minlen=
+  if [[ -z $titletrack ]] ;then
+    minlen=--minlength=4000
+    titletrack=0
+  else
+    minlen=
+  fi
+  LockEncode
+  progress_makemkv mkv file:"$source" "${titletrack}" "$TMP/convert" --cache=1024 --noscan $minlen  -r --progress=-same || return $?
+  Unlock
+  find "$TMP/convert" -printf "%s/%p\000" | sort -z -n -r | {
+    while IFS="/" read -d "" -r size file ; do
+      get_subtitles st -i "$file"
+      handbrake_progress "${HANDBRAKE_ARGS_BLURAY[@]}" "${st[@]}" -i "$file" -o "$output" || return $?
+      exit 0
+    done
+  }
+  OUT="$output"
+  return 0
+}
+  
+
+
+rip_dvd() {
+  local -A disc
+  local -a st=( )
+  local output="$1" i=
+
+  LockDrive
+  
+  get_disc_info disc
+  if [[ -z $output || $output = "auto"  ]] ; then
+    if [[ -z ${disc[title]} ]] ; then
+      er "Cannot find disc title"
+      return 1
+    fi
+    output="${disc[title]}.mkv"
+  fi
+  echo "Ripping dvd to $output"
+  mkdir "$TMP/convert"
+     
+  local titletrack="$2"
+  local minlen=
+  if [[ -z $titletrack ]] ;then
+    minlen=--minlength=4000
+    titletrack=0
+  else
+    minlen=
+  fi
+  progress_makemkv mkv dev:"$DEVICE" "${titletrack}" "$TMP/convert" --cache=1024 --noscan $minlen  -r --progress=-same || return $?
+  Unlock
+  find "$TMP/convert" -printf "%s/%p\000" | sort -z -n -r | {
+    while IFS="/" read -d "" -r size file ; do
+      LockEncode
+      get_subtitles st -i "$file"
+      handbrake_progress "${HANDBRAKE_ARGS_DVD[@]}" "${st[@]}" -i "$file" -o "$output"
+      Bomb "Handbrake exit $?"
+    done
+  }
+  i=$?
+  OUT="$output"
+  return $i
+  
+}
+
+rip_backup() {
+  local -A disc
+  local output="$1"
+  LockDrive
+  get_disc_info disc
+  if [[ -z $output || $output = "auto"  ]] ; then
+    if [[ -z ${disc[title]} ]] ; then
+      er "Cannot find disc title"
+      return 1
+    fi
+    output="${disc[title]}"
+  fi
+  echo "Ripping blu-ray to $output"
+  [[ -d "$output" ]] || mkdir "$output"|| return $? 
+  progress_makemkv --decrypt backup disc:0 "$output" --noscan -r --progress=-same || return $?
+  OUT="$output"
+  return 0
+}
+
+rip_bluray() {
+  local -A disc
+  local output="$1"
+  LockDrive
+  get_disc_info disc
+  if [[ -z $output || $output = "auto"  ]] ; then
+    if [[ -z ${disc[title]} ]] ; then
+      er "Cannot find disc title"
+      return 1
+    fi
+    output="${disc[title]}.mkv"
+  fi
+  echo "Ripping blu-ray to $output"
+  mkdir "$TMP/convert"
+  local titletrack="$2"
+  local minlen=
+  if [[ -z $titletrack ]] ;then
+    minlen=--minlength=4000
+    titletrack=0
+  else
+    minlen=
+  fi
+  progress_makemkv mkv dev:"$DEVICE" "${titletrack}" "$TMP/convert" --cache=1024 --noscan $minlen  -r --progress=-same || return $?
+  Unlock
+  find "$TMP/convert" -printf "%s/%p\000" | sort -z -n -r | {
+    while IFS="/" read -d "" -r size file ; do
+      LockEncode
+      get_subtitles st -i "$file"
+      handbrake_progress "${HANDBRAKE_ARGS_BLURAY[@]}" "${st[@]}" -i "$file" -o "$output" || return $?
+      Bomb "Handbrake exit $?"
+    done
+  }
+  OUT="$output"
+  return 0
+}
+
+rip_file() {
+  Bomb "Not yet supported"
+}
+
+display_info() {
+  local -A disc
+  local i
+  LockDrive
+  get_disc_info disc
+  for i in "${!disc[@]}" ; do
+    printf "%s = %s\n" "$i" "${disc[$i]}"
+  done
+}
+
+track_info() {
+  if [[ -n "$1" ]] ; then
+    makemkvcon -r info file:"$1" --cache=1024 --noscan $minlen
+    return $?
+  fi
+  LockDrive
+  makemkvcon -r info dev:/dev/sr0 --cache=1024 --noscan $minlen 
+  return $?
+}
+ 
+
+help(){
+echo "${0##*/} Bluray/DVD ripper - cpitchford 2015
+
+
+  rip info		Show disc info from udev
+  rip trackinfo		Show disc info from MakeMKV
+  rip backup [auto]	Use MakeMKV to backup disc to folder (automatically
+  			determine name)
+  
+  rip backup foldername Use MakeMKV to backup disc to folder 'foldername'
+
+  rip [upload] <disc|bluray|dvd> [auto|filename] [track]
+  
+    upload	Rip the disc, then upload via SFTP to destination in script
+    
+    disc	Automatically detect disc type
+    bluray	Rip Bluray
+    dvd		Rip DVD
+    
+    auto	Automatically detect filename.mkv
+    filename	Set output to filename
+  
+    n		Rip track number (otherwise first large track)
+  
+E.G:
+  rip disc
+  	Auto filename, auto track, auto disc type
+
+  rip bluray
+  	Auto filename, auto track, force bluray
+
+  rip dvd test.mkv 3  
+  	Output to test.mkv, track 3, force DVD
+  
+  rip upload disc
+  	Auto filename, auto track, auto type, upload on completion
+
+" 1>&2
+  exit 1
+}
+  
+
+case "$1" in
+  ""|disc)
+    shift
+    LockDrive
+    rip_disc "$@"
+  ;;
+  upload)
+    shift
+    OUT=
+    LockDrive
+    rip_disc "$@" || exit $?
+    Unlock
+    upload "$OUT" || exit $?
+    rm "$OUT"
+  ;;
+  dvd)
+    shift
+    LockDrive
+    rip_dvd "$@"
+  ;;
+  bluray|br|bd|blu-ray|blu)
+    shift
+    LockDrive
+    rip_bluray "$@"
+  ;;    
+  backup)
+    shift
+    LockDrive
+    rip_backup "$@"
+  ;;
+  dir)
+    shift
+    rip_dir "$@"
+  ;;
+  info)
+    display_info
+  ;;
+  trackinfo)
+    shift
+    track_info "$@"
+  ;;
+  -h|--help|help)
+    help
+  ;;
+  *) if [[ -r "$1" && -f "$1" ]] ; then
+       rip_file "$@"
+     elif [[ -d "$1" ]] ; then
+       rip_dir "$@"
+     else
+       help
+       exit 1
+     fi
+  ;;
+esac
